@@ -182,28 +182,39 @@ public:
 	// Returns {nearest-item, distance}.
 	std::pair<const Scanset*, Distance> nearest(const Scanset &query) const
 	{
-        Distance best_distance = std::numeric_limits<Distance>::max();
-        const Scanset* best_item = nullptr;
+		Distance best_distance = std::numeric_limits<Distance>::max();
+		std::vector<const Scanset*> candidates;
 		if (!root)
-			return {best_item, best_distance};
+			return {nullptr, best_distance};
 
 		std::function<void(const Node *)> search = [&](const Node *node)
 		{
 			Distance d = distance(query, node->item);
 			if (d < best_distance) {
-                best_distance = d;
-                best_item = &node->item;
-            }
+				best_distance = d;
+				candidates.clear();
+				candidates.push_back(&node->item);
+			} else if (d == best_distance) {
+				candidates.push_back(&node->item);
+			}
 
 			for (const auto &[child_dist, child] : node->children)
 			{
-				if (std::abs(d - best_distance) <= child_dist && child_dist <= d + best_distance)
+				// Triangle inequality pruning
+				if (std::abs(d - child_dist) <= best_distance)
 					search(child.get());
 			}
 		};
 
 		search(root.get());
-		return {best_item, best_distance};
+		
+		if (candidates.empty())
+			return {nullptr, best_distance};
+		
+		// Randomly select one from candidates
+		static std::mt19937_64 rng{std::random_device{}()};
+		std::uniform_int_distribution<size_t> dist(0, candidates.size() - 1);
+		return {candidates[dist(rng)], best_distance};
 	}
 };
 
@@ -251,6 +262,15 @@ Distance get_assignment_distance(std::vector<size_t> &redset_scanset_counters,
 	return compute_per_rs_distance ? total_distance : delta;
 }
 
+Distance compute_num_dst_tables(const Assignment &assignment)
+{
+	std::unordered_map<TableIndex, bool> dst_tables_used;
+	for (const auto& [src, dst] : assignment) {
+		dst_tables_used[dst] = true;
+	}
+	return static_cast<Distance>(dst_tables_used.size());
+}
+
 std::pair<Distance, Assignment> thread_work(
     std::size_t n_iterations, std::size_t thread_idx, const BKTree &bk_tree,
     std::vector<size_t>              redset_scanset_counters,
@@ -278,6 +298,7 @@ std::pair<Distance, Assignment> thread_work(
 		while (true)
 		{
 			Distance best_new_distance   = std::numeric_limits<Distance>::infinity();
+			Distance best_num_dst_tables = 0.0;
 			std::pair<int, int> best_new_assignment = {-1, -1};
             // TODO: Randomize the order in which I traverse rt and bt to avoid repetitive assignments.
 			for (TableIndex rt = 1; rt <= n_redset_tables; rt++)
@@ -300,17 +321,48 @@ std::pair<Distance, Assignment> thread_work(
 					{
 						best_new_distance   = new_distance;
 						best_new_assignment = {rt, bt};
+						best_num_dst_tables = compute_num_dst_tables(assignment);
 					}
+					else if (new_distance == best_new_distance)
+					{
+						// pick the assignment with fewer redset tables assigned to the same tpcds table
+						// to minimize conflicts i.e. more support benchmark tables used
+						Distance num_dst_tables = compute_num_dst_tables(assignment);
+						if (num_dst_tables > best_num_dst_tables)
+						{
+							best_new_distance   = new_distance;
+							best_new_assignment = {rt, bt};
+							best_num_dst_tables = num_dst_tables;
+						}
+						
+					}
+					
 				}
 				assignment[rt] = old_assignment; // revert the assignment
 			}
-            // TODO:!!! When I have the choice over which bt to choose, prefer an unassigned one.
+            // When I have the choice over which bt to choose, prefer an unassigned one.
             // To minimize the number of times I suplicate tables later in workload generation.
 			if (best_new_distance >= current_distance)
 			{
+				if (best_new_distance == current_distance) {
+					// Tiebreaker: pick the assignment with fewer redset tables assigned to the same tpcds table
+					// to minimize conflicts i.e. more support benchmark tables used
+
+					// num tables involved in assignment of last iteration (current_distance)
+					Distance num_dst_tables = compute_num_dst_tables(assignment);
+
+					if (num_dst_tables < best_num_dst_tables) {
+						// although the new assignment does not improve distance,
+						// it improves the number of dst tables used
+						assignment[best_new_assignment.first] =
+						    best_new_assignment.second; // Set the best new global assignment
+					}
+				}
+
 				break; // Local optimum reached
 			}
 
+			// persist the best new assignment
 			assignment[best_new_assignment.first] =
 			    best_new_assignment.second; // Set the best new global assignment
 
